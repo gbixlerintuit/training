@@ -1,0 +1,16 @@
+{
+  "name": "ies-webhook-relay",
+  "version": "1.0.0",
+  "description": "Relays Quickbase pipeline events to the IES/QuickBooks Training partner webhook, handling HMAC-SHA256 signing per their contract.",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
