@@ -11,14 +11,22 @@
  *      backoff schedule (1s, 5s, 30s, 5min, 30min, 6h; 24h total window)
  *   5. on 4xx, fails immediately — no retry, payload needs fixing
  *
- * A failure that happens AFTER Quickbase's request returns (i.e. during a
- * retry) is invisible to the Pipeline. Check Railway logs / GET /queue for
- * real status, not just whatever the initial Pipeline run showed.
+ * On success — whether on the first attempt or after a background retry —
+ * this service writes a success timestamp back into Quickbase itself,
+ * using table_id/record_id/field_id supplied in the ORIGINAL Quickbase
+ * payload. This closes the loop for the delayed-retry case, where the
+ * Pipeline run that triggered the event has long since finished by the
+ * time the partner actually accepts it.
  *
  * Env vars (set in Railway):
  *   INTUIT_INTERNAL_SECRET   - the prod HMAC secret Jason gave you
  *   INBOUND_SHARED_SECRET    - a secret YOU pick; Quickbase must include it
  *                              as "webhook_secret" in the JSON body
+ *   QB_USER_TOKEN            - Quickbase user token, same pattern as your
+ *                              other Railway projects, used to write the
+ *                              success timestamp back to the record
+ *   QB_REALM_HOSTNAME        - e.g. "intuit.quickbase.com" — required by
+ *                              Quickbase's REST API alongside the user token
  *   RETRY_QUEUE_PATH         - optional, defaults to ./retry-queue.json.
  *                              Point this at a mounted Railway Volume path
  *                              (e.g. /data/retry-queue.json) so queued
@@ -38,10 +46,19 @@ app.use(express.json());
 
 const INTUIT_INTERNAL_SECRET = process.env.INTUIT_INTERNAL_SECRET;
 const INBOUND_SHARED_SECRET = process.env.INBOUND_SHARED_SECRET;
+const QB_USER_TOKEN = process.env.QB_USER_TOKEN;
+const QB_REALM_HOSTNAME = process.env.QB_REALM_HOSTNAME;
 const RETRY_QUEUE_PATH = process.env.RETRY_QUEUE_PATH || './retry-queue.json';
 
 if (!INTUIT_INTERNAL_SECRET) throw new Error('Missing INTUIT_INTERNAL_SECRET env var');
 if (!INBOUND_SHARED_SECRET) throw new Error('Missing INBOUND_SHARED_SECRET env var');
+if (!QB_USER_TOKEN) throw new Error('Missing QB_USER_TOKEN env var');
+if (!QB_REALM_HOSTNAME) throw new Error('Missing QB_REALM_HOSTNAME env var');
+
+// Quickbase's built-in "Record ID#" field is always field id 3 — used to
+// target the record on write-back, alongside whatever field_id the
+// Pipeline told us to stamp.
+const QB_RECORD_ID_FIELD = '3';
 
 const PARTNER_HOST = 'intuitenterprisesuitetraining.com';
 const PARTNER_PATH = '/api/partners/intuit/events';
@@ -73,6 +90,12 @@ const REQUIRED_FIELDS = {
   'user.removed_from_org': ['intuit_user_id', 'intuit_org_id'],
   'welcome_email.resend': ['intuit_user_id'],
 };
+
+// Write-back metadata: which Quickbase record to stamp on success, and
+// which field to stamp with the success date/time. Required on every
+// real event — deliberately NOT required on `ping`, since there's no
+// Quickbase record backing a connectivity test.
+const WRITE_BACK_FIELDS = ['table_id', 'record_id', 'field_id'];
 
 // ---------- Persistent retry queue (plain JSON file) ----------
 
@@ -138,6 +161,58 @@ async function attemptSend(bodyString) {
   return { status: response.status, result };
 }
 
+// ---------- Quickbase write-back ----------
+
+/**
+ * Stamps the given field on the given record with the current date/time,
+ * via Quickbase's REST API upsert endpoint. Called on success — whether
+ * that success happened immediately or after a background retry.
+ *
+ * Never throws — a failed write-back is logged loudly but doesn't crash
+ * the retry loop or the request handler. If this fails, the record will
+ * look "unconfirmed" in Quickbase even though the partner accepted the
+ * event; that's a real gap to watch for (check Railway logs / GET /queue
+ * mismatches against Quickbase), but it shouldn't take down the relay.
+ */
+async function stampQuickbaseSuccess({ eventId, eventType, tableId, recordId, fieldId }) {
+  const nowIso = new Date().toISOString();
+
+  const body = {
+    to: tableId,
+    data: [
+      {
+        [QB_RECORD_ID_FIELD]: { value: Number(recordId) },
+        [String(fieldId)]: { value: nowIso },
+      },
+    ],
+  };
+
+  try {
+    const response = await fetch('https://api.quickbase.com/v1/records', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'QB-Realm-Hostname': QB_REALM_HOSTNAME,
+        Authorization: `QB-USER-TOKEN ${QB_USER_TOKEN}`,
+      },
+      body: JSON.stringify(body),
+    });
+
+    const result = await response.json().catch(() => null);
+
+    if (!response.ok) {
+      console.error(`[${eventId}] ${eventType} -> QUICKBASE WRITE-BACK FAILED (${response.status}) for table ${tableId} record ${recordId} field ${fieldId}:`, result);
+      return { ok: false, status: response.status, result };
+    }
+
+    console.log(`[${eventId}] ${eventType} -> stamped ${nowIso} on table ${tableId} record ${recordId} field ${fieldId}`);
+    return { ok: true, status: response.status, result };
+  } catch (err) {
+    console.error(`[${eventId}] ${eventType} -> QUICKBASE WRITE-BACK FAILED (network) for table ${tableId} record ${recordId} field ${fieldId}:`, err);
+    return { ok: false, error: String(err) };
+  }
+}
+
 // ---------- Queue processing ----------
 
 function nextDelayMs(attemptCount) {
@@ -158,6 +233,13 @@ async function processQueueEntry(entry) {
 
   if (status >= 200 && status < 300) {
     console.log(`[${entry.eventId}] ${entry.eventType} -> SUCCESS on retry (attempt ${entry.attemptCount + 1})`, result);
+    await stampQuickbaseSuccess({
+      eventId: entry.eventId,
+      eventType: entry.eventType,
+      tableId: entry.tableId,
+      recordId: entry.recordId,
+      fieldId: entry.fieldId,
+    });
     return 'done';
   }
 
@@ -204,7 +286,15 @@ setInterval(pollQueue, QUEUE_POLL_INTERVAL_MS);
 // ---------- HTTP endpoint ----------
 
 app.post('/webhook/ies-event', async (req, res) => {
-  const { webhook_secret, event_type: eventType, event_id: suppliedEventId, ...rest } = req.body ?? {};
+  const {
+    webhook_secret,
+    event_type: eventType,
+    event_id: suppliedEventId,
+    table_id: tableId,
+    record_id: recordId,
+    field_id: fieldId,
+    ...rest
+  } = req.body ?? {};
 
   if (!secretMatches(webhook_secret)) {
     console.warn('Rejected inbound request: bad or missing webhook_secret in body');
@@ -219,6 +309,18 @@ app.post('/webhook/ies-event', async (req, res) => {
   const missing = required.filter((f) => rest[f] === undefined || rest[f] === null);
   if (missing.length > 0) {
     return res.status(400).json({ error: 'missing_fields', fields: missing });
+  }
+
+  // Write-back metadata required on every real event, not on ping (no
+  // Quickbase record backs a connectivity test).
+  if (eventType !== 'ping') {
+    const writeBackMissing = WRITE_BACK_FIELDS.filter(
+      (f) => ({ table_id: tableId, record_id: recordId, field_id: fieldId })[f] === undefined
+        || ({ table_id: tableId, record_id: recordId, field_id: fieldId })[f] === null
+    );
+    if (writeBackMissing.length > 0) {
+      return res.status(400).json({ error: 'missing_write_back_fields', fields: writeBackMissing });
+    }
   }
 
   // user.created requires a real organization object, not just the key present
@@ -248,7 +350,11 @@ app.post('/webhook/ies-event', async (req, res) => {
     sendResult = await attemptSend(bodyString);
   } catch (err) {
     console.error(`[${eventId}] ${eventType} -> initial send failed (network):`, err);
-    queue.push({ eventId, eventType, bodyString, attemptCount: 1, firstFailedAt: Date.now(), nextAttemptAt: Date.now() + BACKOFF_SCHEDULE_MS[0], lastError: String(err) });
+    queue.push({
+      eventId, eventType, bodyString, tableId, recordId, fieldId,
+      attemptCount: 1, firstFailedAt: Date.now(), nextAttemptAt: Date.now() + BACKOFF_SCHEDULE_MS[0],
+      lastError: String(err),
+    });
     saveQueue(queue);
     return res.status(202).json({ event_id: eventId, queued: true, reason: 'network error on first attempt, retrying in background' });
   }
@@ -257,7 +363,11 @@ app.post('/webhook/ies-event', async (req, res) => {
 
   if (status >= 200 && status < 300) {
     console.log(`[${eventId}] ${eventType} -> partner responded ${status}`, result);
-    return res.status(200).json({ event_id: eventId, partner_status: status, partner_result: result });
+    let qbStamp = null;
+    if (eventType !== 'ping') {
+      qbStamp = await stampQuickbaseSuccess({ eventId, eventType, tableId, recordId, fieldId });
+    }
+    return res.status(200).json({ event_id: eventId, partner_status: status, partner_result: result, qb_stamp: qbStamp });
   }
 
   if (status >= 400 && status < 500) {
@@ -266,7 +376,11 @@ app.post('/webhook/ies-event', async (req, res) => {
   }
 
   // 5xx on first attempt -> queue for retry, tell Quickbase it's in flight
-  queue.push({ eventId, eventType, bodyString, attemptCount: 1, firstFailedAt: Date.now(), nextAttemptAt: Date.now() + BACKOFF_SCHEDULE_MS[0], lastError: `status ${status}` });
+  queue.push({
+    eventId, eventType, bodyString, tableId, recordId, fieldId,
+    attemptCount: 1, firstFailedAt: Date.now(), nextAttemptAt: Date.now() + BACKOFF_SCHEDULE_MS[0],
+    lastError: `status ${status}`,
+  });
   saveQueue(queue);
   console.warn(`[${eventId}] ${eventType} -> partner returned ${status} on first attempt, queued for retry`);
   return res.status(202).json({ event_id: eventId, queued: true, partner_status: status, partner_result: result });
