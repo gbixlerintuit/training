@@ -93,9 +93,11 @@ const REQUIRED_FIELDS = {
 
 // Write-back metadata: which Quickbase record to stamp on success, and
 // which field to stamp with the success date/time. Required on every
-// real event — deliberately NOT required on `ping`, since there's no
-// Quickbase record backing a connectivity test.
+// real event — EXCEPT `ping` (no record backs a connectivity test) and
+// `user.deleted` (the triggering record is gone by the time this fires,
+// so there's nothing left to stamp).
 const WRITE_BACK_FIELDS = ['table_id', 'record_id', 'field_id'];
+const EVENTS_WITHOUT_WRITE_BACK = new Set(['ping', 'user.deleted']);
 
 // ---------- Persistent retry queue (plain JSON file) ----------
 
@@ -233,13 +235,15 @@ async function processQueueEntry(entry) {
 
   if (status >= 200 && status < 300) {
     console.log(`[${entry.eventId}] ${entry.eventType} -> SUCCESS on retry (attempt ${entry.attemptCount + 1})`, result);
-    await stampQuickbaseSuccess({
-      eventId: entry.eventId,
-      eventType: entry.eventType,
-      tableId: entry.tableId,
-      recordId: entry.recordId,
-      fieldId: entry.fieldId,
-    });
+    if (!EVENTS_WITHOUT_WRITE_BACK.has(entry.eventType)) {
+      await stampQuickbaseSuccess({
+        eventId: entry.eventId,
+        eventType: entry.eventType,
+        tableId: entry.tableId,
+        recordId: entry.recordId,
+        fieldId: entry.fieldId,
+      });
+    }
     return 'done';
   }
 
@@ -311,9 +315,10 @@ app.post('/webhook/ies-event', async (req, res) => {
     return res.status(400).json({ error: 'missing_fields', fields: missing });
   }
 
-  // Write-back metadata required on every real event, not on ping (no
-  // Quickbase record backs a connectivity test).
-  if (eventType !== 'ping') {
+  // Write-back metadata required on every real event, except the ones in
+  // EVENTS_WITHOUT_WRITE_BACK (ping has no record; user.deleted's record
+  // is gone by the time this fires).
+  if (!EVENTS_WITHOUT_WRITE_BACK.has(eventType)) {
     const writeBackMissing = WRITE_BACK_FIELDS.filter(
       (f) => ({ table_id: tableId, record_id: recordId, field_id: fieldId })[f] === undefined
         || ({ table_id: tableId, record_id: recordId, field_id: fieldId })[f] === null
@@ -364,7 +369,7 @@ app.post('/webhook/ies-event', async (req, res) => {
   if (status >= 200 && status < 300) {
     console.log(`[${eventId}] ${eventType} -> partner responded ${status}`, result);
     let qbStamp = null;
-    if (eventType !== 'ping') {
+    if (!EVENTS_WITHOUT_WRITE_BACK.has(eventType)) {
       qbStamp = await stampQuickbaseSuccess({ eventId, eventType, tableId, recordId, fieldId });
     }
     return res.status(200).json({ event_id: eventId, partner_status: status, partner_result: result, qb_stamp: qbStamp });
