@@ -74,14 +74,14 @@ const MAX_RETRY_WINDOW_MS = 24 * 60 * 60_000;
 const QUEUE_POLL_INTERVAL_MS = 5_000;
 
 const VALID_EVENT_TYPES = new Set([
-  'ping', '', 'user.updated', 'user.deactivated', 'user.reactivated',
+  'ping', 'user.created', 'user.updated', 'user.deactivated', 'user.reactivated',
   'user.deleted', 'org.created', 'org.updated', 'org.deactivated', 'org.reactivated',
   'user.added_to_org', 'user.removed_from_org', 'welcome_email.resend',
 ]);
 
 const REQUIRED_FIELDS = {
   'ping': [],
-  'user.created': ['intuit_user_id', 'email', 'first_name', 'last_name'],
+  'user.created': ['intuit_user_id', 'email', 'first_name', 'last_name'], // organization is optional — orgs are created via org.created now
   'user.updated': ['intuit_user_id'],
   'user.deactivated': ['intuit_user_id'],
   'user.reactivated': ['intuit_user_id'],
@@ -192,7 +192,7 @@ async function stampQuickbaseSuccess({ eventId, eventType, tableId, keyFieldId, 
 
   const body = {
     to: tableId,
-    mergeFieldId: Number(keyFieldId), // explicit match field — see note above on why field 3 can't be assumed
+    mergeFieldId: Number(keyFieldId), // explicit key field — see note above on why field 3 can't be assumed
     data: [
       {
         [String(keyFieldId)]: { value: keyValue },
@@ -215,14 +215,14 @@ async function stampQuickbaseSuccess({ eventId, eventType, tableId, keyFieldId, 
     const result = await response.json().catch(() => null);
 
     if (!response.ok) {
-      console.error(`[${eventId}] ${eventType} -> QUICKBASE WRITE-BACK FAILED (${response.status}) for table ${tableId} match field ${keyFieldId}=${keyValue} field ${fieldId}:`, result);
+      console.error(`[${eventId}] ${eventType} -> QUICKBASE WRITE-BACK FAILED (${response.status}) for table ${tableId} key field ${keyFieldId}=${keyValue} field ${fieldId}:`, result);
       return { ok: false, status: response.status, result };
     }
 
-    console.log(`[${eventId}] ${eventType} -> stamped ${nowIso} on table ${tableId} (matched field ${keyFieldId}=${keyValue}) field ${fieldId}`);
+    console.log(`[${eventId}] ${eventType} -> stamped ${nowIso} on table ${tableId} (key field ${keyFieldId}=${keyValue}) field ${fieldId}`);
     return { ok: true, status: response.status, result };
   } catch (err) {
-    console.error(`[${eventId}] ${eventType} -> QUICKBASE WRITE-BACK FAILED (network) for table ${tableId} match field ${keyFieldId}=${keyValue} field ${fieldId}:`, err);
+    console.error(`[${eventId}] ${eventType} -> QUICKBASE WRITE-BACK FAILED (network) for table ${tableId} key field ${keyFieldId}=${keyValue} field ${fieldId}:`, err);
     return { ok: false, error: String(err) };
   }
 }
@@ -340,8 +340,9 @@ app.post('/webhook/ies-event', async (req, res) => {
     }
   }
 
-  // user.created requires a real organization object, not just the key present
-  if (eventType === 'user.created') {
+  // organization is optional on user.created now — but if it's present, it
+  // needs to be a real, complete object, not just the key sitting there.
+  if (eventType === 'user.created' && 'organization' in rest) {
     const org = rest.organization;
     const orgMissing = ['intuit_org_id', 'name'].filter(
       (f) => typeof org !== 'object' || org === null || org[f] === undefined || org[f] === null || org[f] === ''
