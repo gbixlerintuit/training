@@ -13,7 +13,7 @@
  *
  * On success — whether on the first attempt or after a background retry —
  * this service writes a success timestamp back into Quickbase itself,
- * using table_id/match_field_id/match_value/field_id supplied in the ORIGINAL Quickbase
+ * using table_id/key_field_id/key_value/field_id supplied in the ORIGINAL Quickbase
  * payload. This closes the loop for the delayed-retry case, where the
  * Pipeline run that triggered the event has long since finished by the
  * time the partner actually accepts it.
@@ -60,7 +60,7 @@ if (!QB_REALM_HOSTNAME) throw new Error('Missing QB_REALM_HOSTNAME env var');
 // a table's configured key field is something else (e.g. a custom Email
 // Address key field) — "You cannot include the record ID if it is not the
 // key field." Instead, every write-back call passes its own mergeFieldId
-// (via match_field_id/match_value in the original Pipeline payload), so
+// (via key_field_id/key_value in the original Pipeline payload), so
 // this works for both record-id-keyed tables and custom-key tables like
 // the Users table (bwdgu5vwg, keyed on Email Address, field 6).
 
@@ -101,13 +101,13 @@ const REQUIRED_FIELDS = {
 // `user.deleted` (the triggering record is gone by the time this fires,
 // so there's nothing left to stamp).
 //   table_id        - the table to write to
-//   match_field_id  - which field identifies the record to update (e.g.
+//   key_field_id  - which field identifies the record to update (e.g.
 //                      3 for Record ID# on most tables, 6 for Email
 //                      Address on the Users table)
-//   match_value     - the value to match on that field (a record ID
+//   key_value     - the value to match on that field (a record ID
 //                      number, or an email address string)
 //   field_id        - the date/time field to stamp with the success time
-const WRITE_BACK_FIELDS = ['table_id', 'match_field_id', 'match_value', 'field_id'];
+const WRITE_BACK_FIELDS = ['table_id', 'key_field_id', 'key_value', 'field_id'];
 const EVENTS_WITHOUT_WRITE_BACK = new Set(['ping', 'user.deleted']);
 
 // ---------- Persistent retry queue (plain JSON file) ----------
@@ -187,15 +187,15 @@ async function attemptSend(bodyString) {
  * event; that's a real gap to watch for (check Railway logs / GET /queue
  * mismatches against Quickbase), but it shouldn't take down the relay.
  */
-async function stampQuickbaseSuccess({ eventId, eventType, tableId, matchFieldId, matchValue, fieldId }) {
+async function stampQuickbaseSuccess({ eventId, eventType, tableId, keyFieldId, keyValue, fieldId }) {
   const nowIso = new Date().toISOString();
 
   const body = {
     to: tableId,
-    mergeFieldId: Number(matchFieldId), // explicit match field — see note above on why field 3 can't be assumed
+    mergeFieldId: Number(keyFieldId), // explicit match field — see note above on why field 3 can't be assumed
     data: [
       {
-        [String(matchFieldId)]: { value: matchValue },
+        [String(keyFieldId)]: { value: keyValue },
         [String(fieldId)]: { value: nowIso },
       },
     ],
@@ -215,14 +215,14 @@ async function stampQuickbaseSuccess({ eventId, eventType, tableId, matchFieldId
     const result = await response.json().catch(() => null);
 
     if (!response.ok) {
-      console.error(`[${eventId}] ${eventType} -> QUICKBASE WRITE-BACK FAILED (${response.status}) for table ${tableId} match field ${matchFieldId}=${matchValue} field ${fieldId}:`, result);
+      console.error(`[${eventId}] ${eventType} -> QUICKBASE WRITE-BACK FAILED (${response.status}) for table ${tableId} match field ${keyFieldId}=${keyValue} field ${fieldId}:`, result);
       return { ok: false, status: response.status, result };
     }
 
-    console.log(`[${eventId}] ${eventType} -> stamped ${nowIso} on table ${tableId} (matched field ${matchFieldId}=${matchValue}) field ${fieldId}`);
+    console.log(`[${eventId}] ${eventType} -> stamped ${nowIso} on table ${tableId} (matched field ${keyFieldId}=${keyValue}) field ${fieldId}`);
     return { ok: true, status: response.status, result };
   } catch (err) {
-    console.error(`[${eventId}] ${eventType} -> QUICKBASE WRITE-BACK FAILED (network) for table ${tableId} match field ${matchFieldId}=${matchValue} field ${fieldId}:`, err);
+    console.error(`[${eventId}] ${eventType} -> QUICKBASE WRITE-BACK FAILED (network) for table ${tableId} match field ${keyFieldId}=${keyValue} field ${fieldId}:`, err);
     return { ok: false, error: String(err) };
   }
 }
@@ -252,8 +252,8 @@ async function processQueueEntry(entry) {
         eventId: entry.eventId,
         eventType: entry.eventType,
         tableId: entry.tableId,
-        matchFieldId: entry.matchFieldId,
-        matchValue: entry.matchValue,
+        keyFieldId: entry.keyFieldId,
+        keyValue: entry.keyValue,
         fieldId: entry.fieldId,
       });
     }
@@ -308,8 +308,8 @@ app.post('/webhook/ies-event', async (req, res) => {
     event_type: eventType,
     event_id: suppliedEventId,
     table_id: tableId,
-    match_field_id: matchFieldId,
-    match_value: matchValue,
+    key_field_id: keyFieldId,
+    key_value: keyValue,
     field_id: fieldId,
     ...rest
   } = req.body ?? {};
@@ -333,7 +333,7 @@ app.post('/webhook/ies-event', async (req, res) => {
   // EVENTS_WITHOUT_WRITE_BACK (ping has no record; user.deleted's record
   // is gone by the time this fires).
   if (!EVENTS_WITHOUT_WRITE_BACK.has(eventType)) {
-    const values = { table_id: tableId, match_field_id: matchFieldId, match_value: matchValue, field_id: fieldId };
+    const values = { table_id: tableId, key_field_id: keyFieldId, key_value: keyValue, field_id: fieldId };
     const writeBackMissing = WRITE_BACK_FIELDS.filter((f) => values[f] === undefined || values[f] === null);
     if (writeBackMissing.length > 0) {
       return res.status(400).json({ error: 'missing_write_back_fields', fields: writeBackMissing });
@@ -379,7 +379,7 @@ app.post('/webhook/ies-event', async (req, res) => {
   } catch (err) {
     console.error(`[${eventId}] ${eventType} -> initial send failed (network):`, err);
     queue.push({
-      eventId, eventType, bodyString, tableId, matchFieldId, matchValue, fieldId,
+      eventId, eventType, bodyString, tableId, keyFieldId, keyValue, fieldId,
       attemptCount: 1, firstFailedAt: Date.now(), nextAttemptAt: Date.now() + BACKOFF_SCHEDULE_MS[0],
       lastError: String(err),
     });
@@ -393,7 +393,7 @@ app.post('/webhook/ies-event', async (req, res) => {
     console.log(`[${eventId}] ${eventType} -> partner responded ${status}`, result);
     let qbStamp = null;
     if (!EVENTS_WITHOUT_WRITE_BACK.has(eventType)) {
-      qbStamp = await stampQuickbaseSuccess({ eventId, eventType, tableId, matchFieldId, matchValue, fieldId });
+      qbStamp = await stampQuickbaseSuccess({ eventId, eventType, tableId, keyFieldId, keyValue, fieldId });
     }
     return res.status(200).json({ event_id: eventId, partner_status: status, partner_result: result, qb_stamp: qbStamp });
   }
@@ -405,7 +405,7 @@ app.post('/webhook/ies-event', async (req, res) => {
 
   // 5xx on first attempt -> queue for retry, tell Quickbase it's in flight
   queue.push({
-    eventId, eventType, bodyString, tableId, matchFieldId, matchValue, fieldId,
+    eventId, eventType, bodyString, tableId, keyFieldId, keyValue, fieldId,
     attemptCount: 1, firstFailedAt: Date.now(), nextAttemptAt: Date.now() + BACKOFF_SCHEDULE_MS[0],
     lastError: `status ${status}`,
   });
