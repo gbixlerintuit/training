@@ -74,14 +74,14 @@ const MAX_RETRY_WINDOW_MS = 24 * 60 * 60_000;
 const QUEUE_POLL_INTERVAL_MS = 5_000;
 
 const VALID_EVENT_TYPES = new Set([
-  'ping', 'user.created', 'user.updated', 'user.deactivated', 'user.reactivated',
+  'ping', '', 'user.updated', 'user.deactivated', 'user.reactivated',
   'user.deleted', 'org.created', 'org.updated', 'org.deactivated', 'org.reactivated',
   'user.added_to_org', 'user.removed_from_org', 'welcome_email.resend',
 ]);
 
 const REQUIRED_FIELDS = {
   'ping': [],
-  'user.created': ['intuit_user_id', 'email', 'first_name', 'last_name', 'organization'],
+  'user.created': ['intuit_user_id', 'email', 'first_name', 'last_name'],
   'user.updated': ['intuit_user_id'],
   'user.deactivated': ['intuit_user_id'],
   'user.reactivated': ['intuit_user_id'],
